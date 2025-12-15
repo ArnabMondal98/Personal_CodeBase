@@ -1,0 +1,225 @@
+import requests
+import json
+import time
+from datetime import datetime, timedelta
+import pandas as pd
+
+# --- Mocking Imports based on your attached codebase structure ---
+# NOTE: In a real environment, you would need to ensure these modules 
+# (db_config, DashboardUtils, constants) are accessible.
+class MockDBConfig:
+    # Example SQL for the new table
+    INSERT_POC_DASHBOARD_QUERY_POSTGRESQL = (
+        "INSERT INTO poc_dashboard_data (formatted_id, creation_date, iteration_end_date, "
+        "spillover_count, spillover_flag, task_count, details, notes, db_type) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
+    )
+    # Placeholder for a cursor execute function
+    def execute(self, query, params):
+        # In a real script, this would execute the SQL query on the database.
+        # print(f"Executing: {query[:50]}... with {params}")
+        pass
+
+class MockConstants:
+    RALLY_API_BASE_URL = "https://rally1.rallydev.com/slm/webservice/v2.0"
+    # Assuming the artifact type we are interested in is 'HierarchicalRequirement' (User Story)
+    ARTIFACT_TYPE = 'HierarchicalRequirement' 
+    TASK_ARTIFACT_TYPE = 'Task'
+    
+# Mock utility function for demonstration
+def mock_db_connector():
+    # In a real script, this would return a database connection object
+    return MockDBConfig()
+
+# --- Custom Logic Functions ---
+
+def calculate_spillover_metrics(first_task_creation_date_str, completion_date_str, iteration_end_date_str):
+    """
+    Calculates the Spillover Count and Spillover Flag based on the defined logic.
+    
+    Logic: (creation date of first task to completion date) > iteration date (15 days)
+    """
+    spillover_count = 0
+    spillover_flag = 'No'
+    
+    # Define the standard iteration duration (15 days)
+    ITERATION_DURATION_DAYS = 15
+    
+    try:
+        # 1. Parse dates
+        if not all([first_task_creation_date_str, completion_date_str, iteration_end_date_str]):
+             # Cannot calculate if dates are missing
+             return 0, 'No'
+             
+        creation_date = datetime.strptime(first_task_creation_date_str.split('T')[0], '%Y-%m-%d')
+        completion_date = datetime.strptime(completion_date_str.split('T')[0], '%Y-%m-%d')
+        iteration_end_date = datetime.strptime(iteration_end_date_str.split('T')[0], '%Y-%m-%d')
+        
+        # 2. Calculate Actual Duration
+        actual_duration = completion_date - creation_date
+        
+        # 3. Check for Spillover condition:
+        # Condition 1: Actual duration exceeds the standard iteration duration (15 days)
+        if actual_duration.days > ITERATION_DURATION_DAYS:
+            spillover_flag = 'Yes'
+            
+            # Condition 2 (Spillover Count): The difference between actual duration 
+            # and the iteration duration is used to calculate the spillover.
+            # A simple interpretation for 'count will increase as per that' is 
+            # the number of full iterations the task spilled into.
+            time_difference = actual_duration.days - ITERATION_DURATION_DAYS
+            spillover_count = time_difference // ITERATION_DURATION_DAYS # Integer division for full spillover periods
+
+    except ValueError as e:
+        print(f"Date parsing error: {e}. Skipping spillover calculation.")
+    except Exception as e:
+        print(f"An unexpected error in spillover calculation: {e}")
+
+    return spillover_count, spillover_flag
+
+
+# --- Main Data Fetching and Processing ---
+
+def fetch_and_process_poc_data(api_key, iteration_end_date):
+    """
+    Fetches User Stories (HierarchicalRequirements) from Rally and calculates POC metrics.
+    """
+    print(f"--- Starting POC Data Fetch for iteration ending {iteration_end_date} ---")
+    
+    headers = {'ZSESSIONID': api_key, 'Content-Type': 'application/json'}
+    artifact_type = MockConstants.ARTIFACT_TYPE
+    
+    # 1. Define the Rally Query 
+    # Query to get stories completed within the last year (for POC scope)
+    query_url = (
+        f"{MockConstants.RALLY_API_BASE_URL}/{artifact_type}"
+        f"?query=((State = 'Completed') AND (CreationDate > \"{datetime.now().year - 1}-01-01\"))"
+        "&fetch=FormattedID,CreationDate,ScheduleState,Tasks,Description,Notes"
+        "&pagesize=2000"
+    )
+
+    try:
+        response = requests.get(query_url, headers=headers, verify=False)
+        if response.status_code != 200:
+            print(f"ERROR: Rally API Status Code: {response.status_code}")
+            return []
+
+        rally_results = response.json().get('QueryResult', {}).get('Results', [])
+        print(f"Fetched {len(rally_results)} {artifact_type} records.")
+
+    except Exception as e:
+        print(f"ERROR fetching data from Rally: {e}")
+        return []
+
+    # 2. Process Results and Calculate Metrics
+    poc_data_list = []
+    for item in rally_results:
+        # A. Basic Column Extraction
+        formatted_id = item.get('FormattedID')
+        creation_date = item.get('CreationDate')
+        
+        # B. Task Column (Task Count)
+        # Rally returns a dictionary with Count for associations like 'Tasks'
+        task_count = item.get('Tasks', {}).get('Count', 0) 
+        
+        # C. Details Column (Description)
+        details_column = item.get('Description', '').replace('\n', ' ').strip()
+        
+        # D. Notes Column (Notes)
+        notes_column = item.get('Notes', '').replace('\n', ' ').strip()
+
+        # E. Spillover Metrics Calculation
+        
+        # To calculate spillover, we need the task's completion date.
+        # Assuming for a 'Completed' story, we can use the latest revision date or a specific field.
+        # For simplicity, we'll use a dummy/placeholder completion date here. 
+        # In a real setup, you'd fetch the latest task completion date or use a specific field.
+        completion_date_str = item.get('CreationDate') # Placeholder: Replace with actual CompletionDate
+        
+        spillover_count, spillover_flag = calculate_spillover_metrics(
+            creation_date, 
+            completion_date_str, 
+            iteration_end_date
+        )
+
+        poc_data_list.append({
+            'formatted_id': formatted_id,
+            'creation_date': creation_date,
+            'iteration_end_date': iteration_end_date,
+            'spillover_count': spillover_count,
+            'spillover_flag': spillover_flag,
+            'task_count': task_count,
+            'details': details_column,
+            'notes': notes_column,
+        })
+        
+    return poc_data_list
+
+
+def insert_data_into_poc_table(data_list, db_type='POSTGRESQL'):
+    """
+    Inserts the processed POC data into the database.
+    (Mirrors the structure of your insert_data_into_story_table function)
+    """
+    if not data_list:
+        print("No data to insert into POC dashboard table.")
+        return
+
+    db_config = mock_db_connector() # Get a mock DB connector/cursor
+    cursor = db_config 
+
+    print(f"Attempting to insert {len(data_list)} records into POC Dashboard table ({db_type}).")
+    
+    # Prepare the data for insertion
+    insert_data = []
+    for item in data_list:
+        # The tuple order must match the SQL query: formatted_id, creation_date, iteration_end_date, ...
+        insert_data.append((
+            item['formatted_id'],
+            item['creation_date'],
+            item['iteration_end_date'],
+            item['spillover_count'],
+            item['spillover_flag'],
+            item['task_count'],
+            item['details'],
+            item['notes'],
+            db_type # Used to identify the source/type in the table if needed
+        ))
+
+    try:
+        if db_type.lower() == 'postgresql':
+            # This logic assumes the use of execute_many or looping for insertion.
+            # In your original code, it looked like a bulk insert was used.
+            # We'll stick to a placeholder for the actual execution:
+            cursor.execute(db_config.INSERT_POC_DASHBOARD_QUERY_POSTGRESQL, insert_data)
+        else:
+            print(f"Skipping insertion for unsupported DB type: {db_type}")
+
+        print("✅ Data insertion attempt completed.")
+        
+    except Exception as e:
+        print(f"❌ Exception found while insert data to POC table: {e}")
+
+
+# --- Main Execution Block ---
+
+def poc_main_function(api_key):
+    """
+    Orchestrates the fetching and insertion process.
+    """
+    # Define the iteration end date (can be dynamic, e.g., today's date)
+    iteration_end_date = datetime.now().strftime('%Y-%m-%d')
+    
+    # 1. Fetch and process data
+    poc_data = fetch_and_process_poc_data(api_key, iteration_end_date)
+    
+    # 2. Insert data into the database
+    insert_data_into_poc_table(poc_data, db_type='POSTGRESQL')
+    # If you need to insert into Oracle as well, call it here with db_type='ORACLE'
+
+
+if __name__ == "__main__":
+    # --- Mock Rally API Key ---
+    # REPLACE 'YOUR_RALLY_API_KEY' with your actual key before running!
+    MOCK_API_KEY = 'YOUR_RALLY_API_KEY' 
+    poc_main_function(MOCK_API_KEY)

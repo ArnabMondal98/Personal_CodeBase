@@ -1,0 +1,97 @@
+import pandas as pd
+import os
+import sys
+
+# --- Configuration ---
+# 1. Define the shared network path and file name
+# IMPORTANT: Use an 'r' string (raw string) or double backslashes for Windows paths.
+# Ensure the user executing the script has READ access to this path.
+SHARE_PATH = r"\\YourServerName\YourShare\DataFolder"
+EXCEL_FILE_NAME = "Artifacts_to_Load.xlsx"
+SHEET_NAME = "Sheet1"  # Name of the specific sheet to read
+
+FULL_EXCEL_PATH = os.path.join(SHARE_PATH, EXCEL_FILE_NAME)
+
+# NOTE: To integrate this data, you will need to import the target 
+# insertion functions from your existing codebase.
+# Assuming your existing file is in the same directory:
+# from DB_Fetch_combined_RAG import insert_data_into_defect_table, insert_data_into_story_table
+# Since I cannot see all required imports, we will use a placeholder function for now.
+
+def process_and_integrate_data(dataframe):
+    """
+    Processes the DataFrame and integrates it with your existing data insertion logic.
+    
+    You MUST replace this placeholder with the actual logic to call your 
+    existing functions (like insert_data_into_defect_table).
+    """
+    if dataframe is None or dataframe.empty:
+        print("No data to process. DataFrame is empty.")
+        return
+
+    print(f"\n--- Starting Integration for {len(dataframe)} records ---")
+
+    # Example: Print column names for verification
+    # print("Columns found in Excel:", dataframe.columns.tolist())
+    
+    # --- Integration Logic Placeholder ---
+    
+    # You need to map the column names in your Excel file to the 
+    # arguments expected by your existing database insertion functions.
+    
+    # Example of how to iterate and call your existing function:
+    # for index, row in dataframe.iterrows():
+    #     try:
+    #         # Assuming your Excel has columns like 'Portfolio', 'Milestone', etc.
+    #         # insert_data_into_defect_table(
+    #         #     portfolio=row['Portfolio_ID'], 
+    #         #     cioinfo=row['CIO_Details'],
+    #         #     milestone_name=row['Milestone'],
+    #         #     ... and all other required parameters from your DB_Fetch file
+    #         # )
+    #         pass # Placeholder logic
+    #     except Exception as e:
+    #         print(f"Error inserting row {index}: {e}")
+            
+    print("Integration completed. Check database for loaded data.")
+
+
+def read_excel_from_sharepath():
+    """
+    Reads data from the specified Excel file on the shared network path.
+    """
+    print(f"Attempting to read Excel file from: {FULL_EXCEL_PATH}")
+    
+    if not os.path.exists(FULL_EXCEL_PATH):
+        print(f"ERROR: File not found. Check the share path: {FULL_EXCEL_PATH}")
+        sys.exit(1)
+
+    try:
+        # Use pandas to read the Excel file. 
+        # engine='openpyxl' is recommended for modern .xlsx files
+        df = pd.read_excel(
+            FULL_EXCEL_PATH,
+            sheet_name=SHEET_NAME,
+            engine='openpyxl'
+        )
+        
+        print(f"✅ Successfully read {len(df)} rows from sheet '{SHEET_NAME}'.")
+        return df
+
+    except PermissionError:
+        print(f"ERROR: Permission denied. Check network access for: {SHARE_PATH}")
+        sys.exit(1)
+    except ValueError as e:
+        print(f"ERROR: Check sheet name ('{SHEET_NAME}') or file integrity: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"An unexpected error occurred while reading the Excel file: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    # Ensure pandas and openpyxl are installed: pip install pandas openpyxl
+    excel_df = read_excel_from_sharepath()
+    
+    if excel_df is not None:
+        process_and_integrate_data(excel_df)

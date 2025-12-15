@@ -1,0 +1,269 @@
+import requests
+import json
+import time
+import pandas as pd
+from datetime import datetime
+from dateutil.parser import parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# --- ASSUMED IMPORTS from your existing structure ---
+# These modules must be present in your environment
+import db_config   # Contains database connections, commit functions, and SQL queries
+import constants   # Contains API keys, database types (ORACLE, POSTGRESQL), and artifact types
+import DashboardUtils # Contains utility functions like get_headers, get_rally_api_url
+
+# --- CONFIGURATION (Define or ensure in constants.py) ---
+SPILLOVER_ITERATION_DAYS = 15
+MAX_DESCRIPTION_LENGTH = 2000
+ARTIFACT_TYPE_STORY = 'HierarchicalRequirement'
+# --------------------------------------------------------
+
+
+# ====================================================================
+# A. NEW POC DASHBOARD LOGIC (Spillover Calculation)
+# ====================================================================
+
+def calculate_spillover_metrics(creation_date_str, completion_date_str):
+    """
+    Calculates the Spillover Count and Spillover Flag based on a 15-day iteration logic.
+    Logic: (Completion Date - Creation Date) > SPILLOVER_ITERATION_DAYS
+    """
+    spillover_flag = 'No'
+    spillover_count = 0
+    
+    if creation_date_str is not None and completion_date_str is not None:
+        try:
+            # Safely parse dates
+            start_date = parse(creation_date_str).date()
+            end_date = parse(completion_date_str).date()
+            
+            # Calculate the duration
+            duration = (end_date - start_date).days
+            
+            if duration > SPILLOVER_ITERATION_DAYS:
+                spillover_flag = 'Yes'
+                # Count increases based on how many 15-day periods were exceeded
+                spillover_count = (duration // SPILLOVER_ITERATION_DAYS) 
+                
+        except Exception as e:
+            print(f"Error calculating spillover metrics: {e}")
+            pass
+
+    return spillover_flag, spillover_count
+
+
+# ====================================================================
+# B. CORE RALLY FETCH AND PROCESSING (Adapted from your attached files)
+# ====================================================================
+
+def fetch_artifacts_by_milestone(api_key, cio_info, portfolio, milestone_name, project_name, artifact_type):
+    """
+    Function to fetch artifacts (Defect/Story) associated with a milestone.
+    This function has been MODIFIED to call the specialized poc_dashboard logic
+    if the artifact_type is a Story.
+    """
+    headers = DashboardUtils.get_headers(api_key)
+    rally_api_url = DashboardUtils.get_rally_api_url(artifact_type)
+    
+    # Define query parameters (Simplified query for example)
+    params = {
+        'workspace': constants.RALLY_WORKSPACE_REF,
+        'query': f'(Project.Name = "{project_name}")', 
+        'pagesize': 200,
+        '_elements': 'FormattedID,Name,CreationDate,ScheduleState,Tasks,Description,Notes,CompletionDate' 
+    }
+
+    try:
+        response = requests.get(rally_api_url, headers=headers, params=params)
+
+        if response.status_code == 200:
+            artifact_results = response.json().get('QueryResult', {}).get('Results', [])
+            
+            if artifact_results:
+                data_frame = pd.DataFrame(artifact_results)
+                print(f"Fetched {len(data_frame)} records for {artifact_type}.")
+                
+                # --- INTEGRATION POINT for POC DASHBOARD ---
+                if artifact_type.lower() == constants.ARTIFACT_TYPE_STORY.lower():
+                    # Process and insert into POC Dashboard table
+                    data_list_poc = process_and_prepare_poc_dashboard(data_frame, portfolio, cio_info, milestone_name, project_name)
+                    insert_data_into_poc_dashboard(constants.DB_TYPE_DEFAULT, data_list_poc)
+                    
+                    # Also insert into the existing Rally Story table (if required by your logic)
+                    # NOTE: Your original file has insert_data_into_story_table
+                    # insert_data_into_story_table(db_config.DB_TYPE_DEFAULT, data_list_rally_story) 
+                    
+                # --- Original Rally Defect/TestCase Logic ---
+                elif artifact_type.lower() == constants.ARTIFACT_TYPE_DEFECT.lower():
+                    # data_list_defect = process_defect_data(data_frame, ...)
+                    # insert_data_into_defect_table(db_config.DB_TYPE_DEFAULT, data_list_defect)
+                    pass # Placeholder for original defect logic
+
+                return True # Success
+
+        else:
+            print(f"Response Status code: {response.status_code} for artifact: {artifact_type}")
+            return False
+
+    except Exception as e:
+        print(f"Exception found during artifact fetch for {artifact_type}: {e}")
+        return False
+        
+    return False
+
+# ---
+
+def fetch_artifacts_for_project(dataset):
+    """
+    # Function to fetch artifacts for a project and milestone using multi-threading.
+    # (Adapted from your original code - Image 8882)
+    """
+    portfolio = dataset[constants.PORTFOLIO]
+    project_name = dataset[constants.PROJECT_NAME]
+    milestone_name = dataset[constants.MILESTONE_NAME]
+    api_key = dataset[constants.RALLY_API_KEY]
+    cio_info = dataset[constants.CIO_INFO]
+    
+    # Define artifact types to fetch (e.g., from constants.py)
+    artifact_types = [constants.ARTIFACT_TYPE_STORY, constants.ARTIFACT_TYPE_DEFECT] 
+
+    future_data = []
+    with ThreadPoolExecutor(max_workers=len(artifact_types)) as executor:
+        for artifact_type in artifact_types:
+            future = executor.submit(
+                fetch_artifacts_by_milestone,
+                api_key, cio_info, portfolio, milestone_name, project_name, artifact_type
+            )
+            future_data.append(future)
+
+    return future_data # Returns list of futures
+
+# ====================================================================
+# C. POC DASHBOARD PROCESSING AND INSERTION
+# ====================================================================
+
+def process_and_prepare_poc_dashboard(df, portfolio, cio_info, milestone_name, project_name):
+    """
+    Prepares data list specifically for the POC Dashboard table,
+    extracting required columns and applying spillover logic.
+    """
+    data_list = []
+    
+    for index, item in df.iterrows():
+        # 1. Extract required fields
+        creation_date = item.get('CreationDate')
+        completion_date = item.get('CompletionDate')
+        
+        # 2. Calculate New Columns (1 & 2)
+        spillover_flag, spillover_count = calculate_spillover_metrics(creation_date, completion_date)
+
+        # 3. Extract/Calculate New Columns (3, 4, 5)
+        task_count = item.get('Tasks', {}).get('Count', 0) if isinstance(item.get('Tasks'), dict) else 0
+        details_char = str(item.get('Description', ''))[:MAX_DESCRIPTION_LENGTH]
+        notes = str(item.get('Notes', ''))
+        
+        # 4. Final Data Tuple for Database Insertion
+        # NOTE: This order MUST match the columns in your SQL INSERT QUERY!
+        data_tuple = (
+            item.get('FormattedID'), 
+            item.get('Name'),
+            item.get('ScheduleState'),
+            spillover_count,          # 1. spillovercount
+            spillover_flag,           # 2. spillover flag
+            task_count,               # 3. Task column
+            details_char,             # 4. details column (Description)
+            notes,                    # 5. Notes 
+            creation_date,            # 6. creationdate
+            completion_date,          # 7. completiondate
+            portfolio,
+            project_name,
+            milestone_name,
+            cio_info
+        )
+        
+        data_list.append(data_tuple)
+        
+    return data_list
+
+
+def insert_data_into_poc_dashboard(db_type, data_list):
+    """
+    Inserts processed story data with spillover metrics into the poc_dashboard table.
+    (This function uses db_config for connections and queries, similar to your original code).
+    """
+    # Using generic Oracle/PostgreSQL logic from your original code structure
+    db_name = constants.ORACLE if db_type.lower() == constants.ORACLE else constants.POSTGRESQL
+    
+    try:
+        conn = db_config.get_db_connection(db_name)
+        cursor = conn.cursor()
+        
+        if db_type.lower() == constants.ORACLE:
+            insert_query = db_config.POC_DASHBOARD_INSERT_QUERY_ORACLE
+        else:
+            insert_query = db_config.POC_DASHBOARD_INSERT_QUERY_POSTGRESQL
+            
+        cursor.executemany(insert_query, data_list)
+        db_config.commit_connection(conn)
+        
+        print(f"✅ Successfully inserted {len(data_list)} records into POC Dashboard ({db_name}).")
+
+    except Exception as e:
+        print(f"❌ Exception found while inserting data to POC Dashboard table ({db_name}): {e}")
+        # Add cleanup/rollback logic here if needed
+    finally:
+        if 'cursor' in locals() and cursor:
+            cursor.close()
+        if 'conn' in locals() and conn:
+            conn.close()
+
+
+# ====================================================================
+# D. MAIN EXECUTION LOOP (Adapted from your original code - Image 8886)
+# ====================================================================
+
+def db_main_function():
+    """
+    The main execution function that runs the data synchronization loop.
+    """
+    print("--- Starting POC Dashboard Data Sync Job ---")
+    
+    # 1. Fetching the list of datasets (projects/milestones) to process
+    # Assuming this data comes from a config file or initial DB query
+    datasets_to_process = db_config.get_datasets_to_process() 
+    
+    start_time = time.time()
+    future_data = []
+
+    # 2. Kick off multi-threaded fetching for all datasets
+    with ThreadPoolExecutor(max_workers=len(datasets_to_process)) as executor:
+        for dataset in datasets_to_process:
+            future = executor.submit(fetch_artifacts_for_project, dataset)
+            future_data.append(future)
+
+    # 3. Wait for all jobs to complete (this only waits for the fetch, insertion happens inside the fetch function)
+    try:
+        for future in as_completed(future_data):
+            future.result() # Wait for results and raise exceptions if any occurred
+            
+        elapsed_time = time.time() - start_time
+        print(f"✅ All fetches and insertions completed. Total time: {elapsed_time:.2f} seconds.")
+
+    except Exception as exc:
+        print(f"❌ Exception found in executing job in main function: {exc}")
+        # Close main connection if required
+        # db_config.conn.close()
+        
+    # 4. Continuous Loop (as seen in your original code)
+    while True:
+        # schedule.run_pending() # If you use the 'schedule' library
+        time.sleep(1) # Sleep to prevent busy-looping
+        db_main_function() # Re-call to start the next iteration
+
+
+if __name__ == "__main__":
+    # Ensure tables are created on startup (optional, but good practice)
+    # create_tables_if_not_exists() 
+    
+    # Start the main execution loop
+    db_main_function()
